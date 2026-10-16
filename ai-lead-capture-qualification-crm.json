@@ -1,0 +1,788 @@
+{
+  "name": "AI Lead Capture, Qualification & CRM Routing",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## AI Lead Capture -> Qualification -> CRM Routing\n\n**Flow:** Webhook -> normalize/validate -> Claude qualification (structured) -> hybrid scoring -> tier switch -> HubSpot + Slack / SDR email / nurture / logging.\n\n**Before activating:**\n1. Add credentials on the Anthropic, HubSpot, Slack, Gmail and Google Sheets nodes.\n2. Replace the placeholder owner emails in **Score & Route** with your real teams.\n3. Set the Slack channel, the Google Sheet ID (`YOUR_GOOGLE_SHEET_ID`) and the Gmail sender.\n4. Point your form at the production webhook: `POST /webhook/lead-capture`.\n\n**Tiers:** hot >= 75, warm >= 50, cold >= 25, below that (or spam >= 0.7) is disqualified.",
+        "height": 480,
+        "width": 480,
+        "color": 4
+      },
+      "id": "note-overview",
+      "name": "Setup Notes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -660,
+        -160
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "lead-capture",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": false
+        }
+      },
+      "id": "webhook-intake",
+      "name": "Lead Intake Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -100,
+        300
+      ],
+      "webhookId": "b3f6a1d2-7c58-4a09-9f21-1e5c7a9d0b41"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Normalize + validate the raw inbound lead ────────────────────────────────\n// Accepts payloads from web forms, chat widgets, ad lead-gen, or another tool.\nconst out = [];\n\nfor (const item of $input.all()) {\n  const raw = item.json.body ?? item.json;\n\n  const pick = (...keys) => {\n    for (const k of keys) {\n      const v = raw[k];\n      if (v !== undefined && v !== null && String(v).trim() !== '') return String(v).trim();\n    }\n    return '';\n  };\n\n  const email = pick('email', 'Email', 'email_address', 'work_email').toLowerCase();\n  let firstName = pick('firstName', 'first_name', 'fname', 'given_name');\n  let lastName = pick('lastName', 'last_name', 'lname', 'family_name');\n  const fullName = pick('name', 'fullName', 'full_name');\n\n  if (!firstName && fullName) {\n    const parts = fullName.split(/\\s+/);\n    firstName = parts.shift() || '';\n    lastName = lastName || parts.join(' ');\n  }\n\n  const phoneRaw = pick('phone', 'phoneNumber', 'phone_number', 'mobile');\n  const phone = phoneRaw.replace(/[^\\d+]/g, '');\n\n  const emailValid = /^[^@\\s]+@[^@\\s.]+\\.[^@\\s]{2,}$/.test(email);\n  const domain = emailValid ? email.split('@')[1] : '';\n\n  const FREE_DOMAINS = [\n    'gmail.com','yahoo.com','hotmail.com','outlook.com','icloud.com','aol.com',\n    'proton.me','protonmail.com','live.com','mail.com','yandex.com','gmx.com',\n    'rediffmail.com','zoho.com'\n  ];\n  const ROLE_PREFIXES = ['info','admin','support','sales','contact','hello','noreply','no-reply','billing','webmaster'];\n\n  const isFreeDomain = FREE_DOMAINS.includes(domain);\n  const isRoleAddress = ROLE_PREFIXES.includes(email.split('@')[0]);\n\n  const company = pick('company', 'companyName', 'company_name', 'organization')\n    || (domain && !isFreeDomain ? domain.split('.')[0].replace(/[-_]/g, ' ') : '');\n\n  const message = pick('message', 'notes', 'comments', 'enquiry', 'inquiry', 'description', 'how_can_we_help');\n\n  // Honeypot field: real users never fill this in.\n  const honeypot = pick('website_url_hp', 'hp', '_honey');\n\n  const lead = {\n    receivedAt: new Date().toISOString(),\n    email,\n    firstName,\n    lastName,\n    fullName: fullName || [firstName, lastName].filter(Boolean).join(' '),\n    phone,\n    company,\n    jobTitle: pick('jobTitle', 'title', 'job_title', 'role'),\n    companySize: pick('companySize', 'company_size', 'employees', 'headcount'),\n    budget: pick('budget', 'budget_range'),\n    timeline: pick('timeline', 'timeframe', 'when'),\n    country: pick('country', 'region'),\n    website: pick('website', 'company_website', 'url'),\n    message,\n    source: pick('source', 'lead_source', 'channel') || 'website_form',\n    formName: pick('formName', 'form', 'form_id') || 'unknown',\n    pageUrl: pick('pageUrl', 'page_url', 'referrer_page'),\n    utm: {\n      source: pick('utm_source'),\n      medium: pick('utm_medium'),\n      campaign: pick('utm_campaign'),\n      term: pick('utm_term'),\n      content: pick('utm_content'),\n    },\n    consent: raw.consent === true || String(raw.consent ?? '').toLowerCase() === 'true',\n    emailDomain: domain,\n    isFreeDomain,\n    isRoleAddress,\n  };\n\n  const errors = [];\n  if (!emailValid) errors.push('invalid_or_missing_email');\n  if (!lead.fullName) errors.push('missing_name');\n  if (honeypot) errors.push('honeypot_triggered');\n\n  out.push({\n    json: {\n      ...lead,\n      isValid: errors.length === 0,\n      validationErrors: errors,\n    },\n  });\n}\n\nreturn out;"
+      },
+      "id": "code-normalize",
+      "name": "Normalize & Validate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        120,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "is-valid",
+              "leftValue": "={{ $json.isValid }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-valid",
+      "name": "Valid Submission?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        340,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=You are a B2B sales development analyst. Qualify this inbound lead.\n\nLEAD\nName: {{ $json.fullName || \"unknown\" }}\nEmail: {{ $json.email }} (domain: {{ $json.emailDomain }}, personal domain: {{ $json.isFreeDomain }}, role address: {{ $json.isRoleAddress }})\nCompany: {{ $json.company || \"unknown\" }}\nJob title: {{ $json.jobTitle || \"unknown\" }}\nStated company size: {{ $json.companySize || \"unknown\" }}\nStated budget: {{ $json.budget || \"unknown\" }}\nStated timeline: {{ $json.timeline || \"unknown\" }}\nCountry: {{ $json.country || \"unknown\" }}\nWebsite: {{ $json.website || \"unknown\" }}\nPhone given: {{ $json.phone ? \"yes\" : \"no\" }}\nSource: {{ $json.source }} / form: {{ $json.formName }} / page: {{ $json.pageUrl }}\nCampaign: {{ $json.utm.source }} / {{ $json.utm.medium }} / {{ $json.utm.campaign }}\n\nMESSAGE\n\"\"\"\n{{ $json.message || \"(no message provided)\" }}\n\"\"\"\n\nSCORING GUIDANCE\n- fit_score (0-100): how well the account profile matches an ideal customer - seniority, company size, industry, budget signals.\n- intent_score (0-100): how ready they are to buy now - explicit ask, urgency, timeline, evaluation language, specific use case.\n- Treat vague one-liners, job seekers, students, vendors pitching us, and marketing spam as low intent; set spam_probability accordingly.\n- Judge only from what is written. Do not invent facts about the company. Use \"unknown\" when a field is not evidenced.\n- reasoning: two or three sentences a rep can read in five seconds.\n- suggested_next_step: one concrete action, e.g. \"Book a 20-min discovery call this week\".",
+        "hasOutputParser": true
+      },
+      "id": "chain-qualify",
+      "name": "AI Qualify Lead",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.5,
+      "position": [
+        580,
+        200
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "claude-sonnet-5",
+          "mode": "list",
+          "cachedResultName": "Claude Sonnet 5"
+        },
+        "options": {
+          "temperature": 0.1,
+          "maxTokensToSample": 1024
+        }
+      },
+      "id": "lm-anthropic",
+      "name": "Anthropic Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.3,
+      "position": [
+        540,
+        440
+      ]
+    },
+    {
+      "parameters": {
+        "schemaType": "manual",
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"qualification\": {\n      \"type\": \"string\",\n      \"enum\": [\n        \"hot\",\n        \"warm\",\n        \"cold\",\n        \"disqualified\"\n      ],\n      \"description\": \"Overall qualification verdict\"\n    },\n    \"fit_score\": {\n      \"type\": \"number\",\n      \"description\": \"ICP fit, 0-100\"\n    },\n    \"intent_score\": {\n      \"type\": \"number\",\n      \"description\": \"Buying intent, 0-100\"\n    },\n    \"spam_probability\": {\n      \"type\": \"number\",\n      \"description\": \"Probability the submission is spam or irrelevant, 0-1\"\n    },\n    \"intent\": {\n      \"type\": \"string\",\n      \"enum\": [\n        \"demo_request\",\n        \"pricing\",\n        \"product_question\",\n        \"partnership\",\n        \"support\",\n        \"job_seeker\",\n        \"vendor_pitch\",\n        \"spam\",\n        \"other\"\n      ]\n    },\n    \"seniority\": {\n      \"type\": \"string\",\n      \"enum\": [\n        \"c_level\",\n        \"vp\",\n        \"director\",\n        \"manager\",\n        \"individual_contributor\",\n        \"unknown\"\n      ]\n    },\n    \"company_size_estimate\": {\n      \"type\": \"string\",\n      \"enum\": [\n        \"1-10\",\n        \"11-50\",\n        \"51-200\",\n        \"201-1000\",\n        \"1000+\",\n        \"unknown\"\n      ]\n    },\n    \"budget_signal\": {\n      \"type\": \"string\",\n      \"enum\": [\n        \"explicit\",\n        \"implied\",\n        \"none\",\n        \"unknown\"\n      ]\n    },\n    \"timeline\": {\n      \"type\": \"string\",\n      \"enum\": [\n        \"immediate\",\n        \"this_quarter\",\n        \"this_year\",\n        \"exploratory\",\n        \"unknown\"\n      ]\n    },\n    \"use_case\": {\n      \"type\": \"string\",\n      \"description\": \"Short phrase describing what they want to solve\"\n    },\n    \"summary\": {\n      \"type\": \"string\",\n      \"description\": \"One-line summary of the lead for a Slack alert\"\n    },\n    \"reasoning\": {\n      \"type\": \"string\",\n      \"description\": \"2-3 sentences justifying the scores\"\n    },\n    \"suggested_next_step\": {\n      \"type\": \"string\",\n      \"description\": \"The single next action for the rep\"\n    }\n  },\n  \"required\": [\n    \"qualification\",\n    \"fit_score\",\n    \"intent_score\",\n    \"spam_probability\",\n    \"intent\",\n    \"seniority\",\n    \"company_size_estimate\",\n    \"budget_signal\",\n    \"timeline\",\n    \"use_case\",\n    \"summary\",\n    \"reasoning\",\n    \"suggested_next_step\"\n  ]\n}"
+      },
+      "id": "parser-structured",
+      "name": "Qualification Schema",
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.2,
+      "position": [
+        740,
+        440
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Blend the AI judgement with deterministic firmographic rules ─────────────\n// The AI handles language/intent; the rules keep scoring stable and auditable.\nconst items = [];\n\nfor (const item of $input.all()) {\n  const lead = $('Normalize & Validate').itemMatching(item.pairedItem?.item ?? 0).json;\n  const ai = item.json.output ?? item.json;\n\n  const clamp = (n) => Math.max(0, Math.min(100, Number(n) || 0));\n\n  const fitScore = clamp(ai.fit_score);\n  const intentScore = clamp(ai.intent_score);\n  const spam = Number(ai.spam_probability) || 0;\n\n  // Weighted base: intent matters slightly more than fit for inbound.\n  let score = Math.round(fitScore * 0.45 + intentScore * 0.55);\n\n  const adjustments = [];\n  const bump = (points, why) => { score += points; adjustments.push(`${points > 0 ? '+' : ''}${points} ${why}`); };\n\n  if (lead.isFreeDomain) bump(-12, 'personal email domain');\n  if (lead.isRoleAddress) bump(-6, 'role-based address');\n  if (lead.phone) bump(4, 'phone provided');\n  if (lead.company) bump(4, 'company provided');\n  if ((lead.message || '').length > 180) bump(5, 'detailed enquiry');\n  if ((lead.message || '').length < 20) bump(-8, 'thin enquiry');\n  if (/enterprise|procurement|rfp|rfq|contract|pilot|poc/i.test(lead.message || '')) bump(6, 'buying-process language');\n  if (/student|assignment|internship|job opening|resume|cv|hiring/i.test(lead.message || '')) bump(-25, 'not a buyer');\n  if (lead.utm.campaign) bump(3, 'attributed campaign');\n\n  score = clamp(score);\n\n  // ── Tier + routing ────────────────────────────────────────────────────────\n  let tier;\n  if (spam >= 0.7 || ai.qualification === 'disqualified' || score < 25) tier = 'disqualified';\n  else if (score >= 75) tier = 'hot';\n  else if (score >= 50) tier = 'warm';\n  else tier = 'cold';\n\n  const routing = {\n    hot:          { owner: 'ae-team@yourcompany.com',  pipelineStage: 'qualifiedtobuy',       slaHours: 1,    lifecycleStage: 'salesqualifiedlead' },\n    warm:         { owner: 'sdr-team@yourcompany.com', pipelineStage: 'appointmentscheduled', slaHours: 24,   lifecycleStage: 'marketingqualifiedlead' },\n    cold:         { owner: 'nurture@yourcompany.com',  pipelineStage: 'lead',                 slaHours: 168,  lifecycleStage: 'lead' },\n    disqualified: { owner: 'unassigned',               pipelineStage: 'lead',                 slaHours: null, lifecycleStage: 'other' },\n  }[tier];\n\n  items.push({\n    json: {\n      ...lead,\n      ai: {\n        qualification: ai.qualification,\n        intent: ai.intent,\n        seniority: ai.seniority,\n        companySizeEstimate: ai.company_size_estimate,\n        budgetSignal: ai.budget_signal,\n        timelineSignal: ai.timeline,\n        useCase: ai.use_case,\n        fitScore,\n        intentScore,\n        spamProbability: spam,\n        summary: ai.summary,\n        reasoning: ai.reasoning,\n        nextStep: ai.suggested_next_step,\n      },\n      leadScore: score,\n      scoreAdjustments: adjustments,\n      tier,\n      ...routing,\n      dealName: `${lead.company || lead.fullName || lead.email} — ${ai.use_case || 'Inbound enquiry'}`,\n      processedAt: new Date().toISOString(),\n    },\n  });\n}\n\nreturn items;"
+      },
+      "id": "code-score",
+      "name": "Score & Route",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        860,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "r-hot",
+                    "leftValue": "={{ $json.tier }}",
+                    "rightValue": "hot",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "hot"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "r-warm",
+                    "leftValue": "={{ $json.tier }}",
+                    "rightValue": "warm",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "warm"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "r-cold",
+                    "leftValue": "={{ $json.tier }}",
+                    "rightValue": "cold",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "cold"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "r-dq",
+                    "leftValue": "={{ $json.tier }}",
+                    "rightValue": "disqualified",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "disqualified"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "switch-tier",
+      "name": "Route by Tier",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        1080,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "appToken",
+        "resource": "contact",
+        "email": "={{ $json.email }}",
+        "additionalFields": {
+          "firstName": "={{ $json.firstName }}",
+          "lastName": "={{ $json.lastName }}",
+          "companyName": "={{ $json.company }}",
+          "jobTitle": "={{ $json.jobTitle }}",
+          "phoneNumber": "={{ $json.phone }}",
+          "websiteUrl": "={{ $json.website }}",
+          "lifeCycleStage": "={{ $json.lifecycleStage }}",
+          "message": "={{ $json.ai.summary }}"
+        },
+        "options": {}
+      },
+      "id": "hubspot-hot",
+      "name": "HubSpot Upsert Hot Contact",
+      "type": "n8n-nodes-base.hubspot",
+      "typeVersion": 2.1,
+      "position": [
+        1340,
+        -80
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true
+    },
+    {
+      "parameters": {
+        "authentication": "appToken",
+        "resource": "deal",
+        "operation": "create",
+        "stage": "={{ $json.pipelineStage }}",
+        "additionalFields": {
+          "dealName": "={{ $json.dealName }}",
+          "description": "={{ $json.ai.summary }} | {{ $json.ai.reasoning }}"
+        },
+        "options": {}
+      },
+      "id": "hubspot-deal",
+      "name": "HubSpot Create Deal",
+      "type": "n8n-nodes-base.hubspot",
+      "typeVersion": 2.1,
+      "position": [
+        1560,
+        -80
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "#sales-hot-leads",
+          "mode": "name"
+        },
+        "messageType": "block",
+        "blocksUi": "={\n  \"blocks\": [\n    {\n      \"type\": \"header\",\n      \"text\": {\n        \"type\": \"plain_text\",\n        \"text\": \"🔥 Hot lead - respond within 1 hour\",\n        \"emoji\": true\n      }\n    },\n    {\n      \"type\": \"section\",\n      \"fields\": [\n        {\n          \"type\": \"mrkdwn\",\n          \"text\": \"*Name:*\\n{{ $json.fullName }}\"\n        },\n        {\n          \"type\": \"mrkdwn\",\n          \"text\": \"*Email:*\\n{{ $json.email }}\"\n        },\n        {\n          \"type\": \"mrkdwn\",\n          \"text\": \"*Company:*\\n{{ $json.company || \\\"-\\\" }}\"\n        },\n        {\n          \"type\": \"mrkdwn\",\n          \"text\": \"*Title:*\\n{{ $json.jobTitle || \\\"-\\\" }}\"\n        },\n        {\n          \"type\": \"mrkdwn\",\n          \"text\": \"*Score:*\\n{{ $json.leadScore }}/100 (fit {{ $json.ai.fitScore }} / intent {{ $json.ai.intentScore }})\"\n        },\n        {\n          \"type\": \"mrkdwn\",\n          \"text\": \"*Source:*\\n{{ $json.source }} / {{ $json.utm.campaign || \\\"no campaign\\\" }}\"\n        }\n      ]\n    },\n    {\n      \"type\": \"section\",\n      \"text\": {\n        \"type\": \"mrkdwn\",\n        \"text\": \"*Summary:* {{ $json.ai.summary }}\\n*Why:* {{ $json.ai.reasoning }}\\n*Next step:* {{ $json.ai.nextStep }}\"\n      }\n    },\n    {\n      \"type\": \"context\",\n      \"elements\": [\n        {\n          \"type\": \"mrkdwn\",\n          \"text\": \"Assigned to {{ $json.owner }} - SLA {{ $json.slaHours }}h - use case: {{ $json.ai.useCase }}\"\n        }\n      ]\n    }\n  ]\n}",
+        "otherOptions": {
+          "includeLinkToWorkflow": false
+        }
+      },
+      "id": "slack-hot",
+      "name": "Slack Alert Sales",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [
+        1780,
+        -80
+      ],
+      "onError": "continueRegularOutput",
+      "webhookId": "a91c7e40-2b6d-4f83-8e51-7d0c3b6a1f92"
+    },
+    {
+      "parameters": {
+        "authentication": "appToken",
+        "resource": "contact",
+        "email": "={{ $json.email }}",
+        "additionalFields": {
+          "firstName": "={{ $json.firstName }}",
+          "lastName": "={{ $json.lastName }}",
+          "companyName": "={{ $json.company }}",
+          "jobTitle": "={{ $json.jobTitle }}",
+          "phoneNumber": "={{ $json.phone }}",
+          "lifeCycleStage": "={{ $json.lifecycleStage }}",
+          "message": "={{ $json.ai.summary }}"
+        },
+        "options": {}
+      },
+      "id": "hubspot-warm",
+      "name": "HubSpot Upsert Warm Contact",
+      "type": "n8n-nodes-base.hubspot",
+      "typeVersion": 2.1,
+      "position": [
+        1340,
+        160
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $json.owner }}",
+        "subject": "=[Warm lead {{ $json.leadScore }}/100] {{ $json.fullName }} - {{ $json.company || \"no company\" }}",
+        "emailType": "text",
+        "message": "=New warm lead assigned to you (SLA {{ $json.slaHours }}h).\n\nName: {{ $json.fullName }}\nEmail: {{ $json.email }}\nPhone: {{ $json.phone || \"-\" }}\nCompany: {{ $json.company || \"-\" }} ({{ $json.ai.companySizeEstimate }})\nTitle: {{ $json.jobTitle || \"-\" }} ({{ $json.ai.seniority }})\n\nScore: {{ $json.leadScore }}/100 - fit {{ $json.ai.fitScore }}, intent {{ $json.ai.intentScore }}\nAdjustments: {{ $json.scoreAdjustments.join(\", \") }}\n\nUse case: {{ $json.ai.useCase }}\nTimeline: {{ $json.ai.timelineSignal }} | Budget signal: {{ $json.ai.budgetSignal }}\n\nSummary: {{ $json.ai.summary }}\nWhy: {{ $json.ai.reasoning }}\nNext step: {{ $json.ai.nextStep }}\n\nTheir message:\n{{ $json.message }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "gmail-warm",
+      "name": "Gmail Notify SDR",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1560,
+        160
+      ],
+      "onError": "continueRegularOutput",
+      "webhookId": "c72d5b18-9a34-4d67-b210-4f81e6a25c73"
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $json.email }}",
+        "subject": "=Thanks for getting in touch, {{ $json.firstName || \"there\" }}",
+        "emailType": "text",
+        "message": "=Hi {{ $json.firstName || \"there\" }},\n\nThanks for reaching out - I saw your note about {{ $json.ai.useCase || \"what you are working on\" }}.\n\nI have put together a couple of things that usually help at this stage:\n\n- A short overview of how teams like yours get started\n- A pricing outline so you know what to expect\n\nIf it would be easier to talk it through, reply with a time that suits you and I will send an invite.\n\nBest,\nThe Sales Team",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "gmail-cold",
+      "name": "Gmail Nurture Reply",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1340,
+        400
+      ],
+      "onError": "continueRegularOutput",
+      "webhookId": "d83e6c29-1b45-4e78-c321-5a92f7b36d84"
+    },
+    {
+      "parameters": {
+        "authentication": "appToken",
+        "resource": "contact",
+        "email": "={{ $json.email }}",
+        "additionalFields": {
+          "firstName": "={{ $json.firstName }}",
+          "lastName": "={{ $json.lastName }}",
+          "companyName": "={{ $json.company }}",
+          "lifeCycleStage": "={{ $json.lifecycleStage }}",
+          "message": "={{ $json.ai.summary }}"
+        },
+        "options": {}
+      },
+      "id": "hubspot-cold",
+      "name": "HubSpot Upsert Cold Contact",
+      "type": "n8n-nodes-base.hubspot",
+      "typeVersion": 2.1,
+      "position": [
+        1560,
+        400
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Leads",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "received_at": "={{ $json.receivedAt }}",
+            "email": "={{ $json.email }}",
+            "name": "={{ $json.fullName }}",
+            "company": "={{ $json.company }}",
+            "job_title": "={{ $json.jobTitle }}",
+            "source": "={{ $json.source }}",
+            "campaign": "={{ $json.utm.campaign }}",
+            "tier": "={{ $json.tier }}",
+            "lead_score": "={{ $json.leadScore }}",
+            "fit_score": "={{ $json.ai.fitScore }}",
+            "intent_score": "={{ $json.ai.intentScore }}",
+            "intent": "={{ $json.ai.intent }}",
+            "use_case": "={{ $json.ai.useCase }}",
+            "owner": "={{ $json.owner }}",
+            "summary": "={{ $json.ai.summary }}",
+            "reasoning": "={{ $json.ai.reasoning }}",
+            "message": "={{ $json.message }}"
+          },
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "sheets-log",
+      "name": "Sheets Log Every Lead",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        2020,
+        200
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Disqualified",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "received_at": "={{ $json.receivedAt }}",
+            "email": "={{ $json.email }}",
+            "name": "={{ $json.fullName }}",
+            "source": "={{ $json.source }}",
+            "lead_score": "={{ $json.leadScore }}",
+            "spam_probability": "={{ $json.ai.spamProbability }}",
+            "intent": "={{ $json.ai.intent }}",
+            "reason": "={{ $json.ai.reasoning }}",
+            "message": "={{ $json.message }}"
+          },
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "sheets-dq",
+      "name": "Sheets Log Disqualified",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1340,
+        620
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: \"accepted\", tier: $json.tier, leadScore: $json.leadScore, nextStep: $json.ai.nextStep, receivedAt: $json.receivedAt }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "respond-ok",
+      "name": "Respond Accepted",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        2260,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: \"rejected\", errors: $json.validationErrors }) }}",
+        "options": {
+          "responseCode": 400
+        }
+      },
+      "id": "respond-bad",
+      "name": "Respond Rejected",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        580,
+        660
+      ]
+    }
+  ],
+  "connections": {
+    "Lead Intake Webhook": {
+      "main": [
+        [
+          {
+            "node": "Normalize & Validate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize & Validate": {
+      "main": [
+        [
+          {
+            "node": "Valid Submission?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Valid Submission?": {
+      "main": [
+        [
+          {
+            "node": "AI Qualify Lead",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Rejected",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anthropic Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Qualify Lead",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Qualification Schema": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "AI Qualify Lead",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Qualify Lead": {
+      "main": [
+        [
+          {
+            "node": "Score & Route",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Score & Route": {
+      "main": [
+        [
+          {
+            "node": "Route by Tier",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by Tier": {
+      "main": [
+        [
+          {
+            "node": "HubSpot Upsert Hot Contact",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "HubSpot Upsert Warm Contact",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Gmail Nurture Reply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Sheets Log Disqualified",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HubSpot Upsert Hot Contact": {
+      "main": [
+        [
+          {
+            "node": "HubSpot Create Deal",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HubSpot Create Deal": {
+      "main": [
+        [
+          {
+            "node": "Slack Alert Sales",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack Alert Sales": {
+      "main": [
+        [
+          {
+            "node": "Sheets Log Every Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HubSpot Upsert Warm Contact": {
+      "main": [
+        [
+          {
+            "node": "Gmail Notify SDR",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gmail Notify SDR": {
+      "main": [
+        [
+          {
+            "node": "Sheets Log Every Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gmail Nurture Reply": {
+      "main": [
+        [
+          {
+            "node": "HubSpot Upsert Cold Contact",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HubSpot Upsert Cold Contact": {
+      "main": [
+        [
+          {
+            "node": "Sheets Log Every Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sheets Log Disqualified": {
+      "main": [
+        [
+          {
+            "node": "Sheets Log Every Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sheets Log Every Lead": {
+      "main": [
+        [
+          {
+            "node": "Respond Accepted",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "pinData": {},
+  "meta": {
+    "instanceId": "local"
+  },
+  "tags": []
+}
